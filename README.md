@@ -18,7 +18,7 @@ flowchart TD
         Store -.->|"Active Sweep (every 100ms)"| Sweeper["Active Expiry Task"]
         
         Dispatch -->|"2. If State Changed"| AOF["AOF Logger (aof.py)"]
-        AOF -->|"fsync: always | everysec | no"| Disk[("appendonly.aof")]
+        AOF -->|"fsync: always, everysec or no"| Disk[("appendonly.aof")]
         
         Disk -.->|"Replay on Startup"| Replay["AOF Replay Engine"]
         Replay -.->|"Execute Logged Writes"| Store
@@ -42,7 +42,7 @@ flowchart TD
 - **AOF Persistence**:
   - Canonical absolute timestamps (`PXAT` and `PEXPIREAT`) prevent key revival across server restarts.
   - State-change filtering: Only mutating commands that actually changed state are appended.
-  - Crash recovery: Detects incomplete trailing records (mid-write crash) and automatically truncates the file back to the last valid offset while raising [`AofCorruptedError`](file:///C:/Users/Sheethal/.gemini/antigravity-ide/scratch/mini_redis/mini_redis/aof.py#L27-L29) on corrupted records.
+  - Crash recovery: Detects incomplete trailing records (mid-write crash) and automatically truncates the file back to the last valid offset while raising `AofCorruptedError` on corrupted records.
   - Configurable `fsync` policies: `always`, `everysec` (background task), and `no`.
 
 ---
@@ -75,7 +75,7 @@ flowchart TD
 3. **Lazy + Active Expiry Hybrid**:
    Passive lazy checks guarantee zero stale reads on any command invocation. However, keys that are never read again would leak memory indefinitely without an active sweeper. The 100 ms active background task samples randomized batches and dynamically increases frequency if the expiration density exceeds $25\%$.
 4. **Truncated-Tail Recovery vs. Corrupted Middle Abort**:
-   When a process crashes or power is lost mid-write, the last record in the AOF may be partially written. Replay recognizes incomplete records at EOF (`IncompleteDataError`), truncates the file back to the end of the last complete record, logs a warning, and continues startup. Conversely, syntax corruptions in the middle of the log raise [`AofCorruptedError`](file:///C:/Users/Sheethal/.gemini/antigravity-ide/scratch/mini_redis/mini_redis/aof.py#L27-L29) and prevent startup to avoid silent data loss.
+   When a process crashes or power is lost mid-write, the last record in the AOF may be partially written. Replay recognizes incomplete records at EOF (`IncompleteDataError`), truncates the file back to the end of the last complete record, logs a warning, and continues startup. Conversely, syntax corruptions in the middle of the log raise `AofCorruptedError` and prevent startup to avoid silent data loss.
 5. **Always Fsync Blocking the Event Loop (Durability vs. Throughput Trade-off)**:
    In Python standard library `asyncio`, file descriptors on disk do not support asynchronous `fsync` out of the box without threads. Calling `os.fsync` synchronously in `--appendfsync always` guarantees durability before replying to the client, but intentionally limits single-threaded throughput (~1,291 ops/sec vs ~9,454 ops/sec with `everysec`).
 
@@ -145,6 +145,8 @@ python bench.py --port 6379 -n 50000 -c 10
 
 ---
 
+> **Note:** one run per policy, with a Python load generator on the same machine and no pipelining, so treat these numbers as indicative only. Run-to-run variance is large: the 'no' policy measured slower than 'everysec' even though it should not be, which is most likely noise.
+
 ## Limitations & Future Work
 
 - **Data Structures**: Only string values are supported; no lists, hashes, sets, sorted sets, or streams.
@@ -157,4 +159,4 @@ python bench.py --port 6379 -n 50000 -c 10
 
 ## License
 
-MIT License. See [LICENSE](file:///C:/Users/Sheethal/.gemini/antigravity-ide/scratch/mini_redis/LICENSE) for details.
+MIT License. See [LICENSE](LICENSE) for details.
