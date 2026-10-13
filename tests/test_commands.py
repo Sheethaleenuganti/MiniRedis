@@ -59,7 +59,7 @@ class TestCommands:
 
         res2 = execute_command(store, [b"SET", b"k", b"v", b"extra"])
         assert isinstance(res2, RespError)
-        assert res2.message == "ERR wrong number of arguments for 'set' command"
+        assert res2.message == "ERR syntax error"
 
     def test_get_wrong_args(self, store: Store) -> None:
         res = execute_command(store, [b"GET"])

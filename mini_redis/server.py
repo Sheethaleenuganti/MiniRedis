@@ -4,6 +4,7 @@ Runs an asyncio TCP server binding to 127.0.0.1:6379 by default.
 Features:
 - Pipelining support: process all parsed messages in the buffer before draining.
 - Connection resilience: closes gracefully on client disconnect or protocol errors without tracebacks.
+- Active TTL expiration: background task sampling and purging expired keys every 100 ms.
 - Windows-compatible: standard library asyncio, no Unix-only calls or signals.
 """
 
@@ -32,6 +33,7 @@ class Server:
         self._configured_port = port
         self.store = store or Store()
         self._server: Optional[asyncio.Server] = None
+        self._active_expiry_task: Optional[asyncio.Task] = None
 
     @property
     def port(self) -> int:
@@ -40,6 +42,18 @@ class Server:
             sock = self._server.sockets[0]
             return sock.getsockname()[1]
         return self._configured_port
+
+    async def _active_expiry_loop(self) -> None:
+        """Background coroutine that samples and purges expired keys every 100 ms."""
+        try:
+            while True:
+                await asyncio.sleep(0.1)  # 100 ms
+                self.store.active_expire_sweep(
+                    sample_size=20, threshold_ratio=0.25, max_loops=10
+                )
+        except asyncio.CancelledError:
+            # Clean cancellation on server shutdown
+            pass
 
     async def handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -98,13 +112,22 @@ class Server:
                 pass
 
     async def start(self) -> None:
-        """Start listening for incoming client connections."""
+        """Start listening for incoming client connections and launch background tasks."""
         self._server = await asyncio.start_server(
             self.handle_client, host=self.host, port=self._configured_port
         )
+        self._active_expiry_task = asyncio.create_task(self._active_expiry_loop())
 
     async def stop(self) -> None:
-        """Stop listening and close the server."""
+        """Stop listening, cancel background tasks, and close the server."""
+        if self._active_expiry_task:
+            self._active_expiry_task.cancel()
+            try:
+                await self._active_expiry_task
+            except asyncio.CancelledError:
+                pass
+            self._active_expiry_task = None
+
         if self._server:
             self._server.close()
             await self._server.wait_closed()

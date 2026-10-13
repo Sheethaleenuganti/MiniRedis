@@ -12,6 +12,13 @@ from mini_redis.store import Store
 CommandHandler = Callable[[Store, list[Any]], Any]
 
 
+def _to_bytes(val: Any) -> bytes:
+    """Helper to convert any argument to bytes."""
+    if isinstance(val, (bytes, bytearray)):
+        return bytes(val)
+    return str(val).encode("utf-8")
+
+
 # ---------------------------------------------------------------------------
 # Command Handlers
 # ---------------------------------------------------------------------------
@@ -40,32 +47,77 @@ def handle_echo(_store: Store, args: list[Any]) -> Any:
 
 def handle_set(store: Store, args: list[Any]) -> Any:
     """
-    SET key value
-    Sets key to hold string value.
+    SET key value [EX seconds | PX milliseconds]
+    Sets key to hold string value with optional expiration.
     """
-    if len(args) != 2:
+    if len(args) < 2:
         return RespError("ERR wrong number of arguments for 'set' command")
 
-    key, value = args[0], args[1]
-    # Ensure key and value are bytes
-    key_bytes = key if isinstance(key, bytes) else str(key).encode("utf-8")
-    val_bytes = value if isinstance(value, bytes) else str(value).encode("utf-8")
+    key_bytes = _to_bytes(args[0])
+    val_bytes = _to_bytes(args[1])
 
-    store.set(key_bytes, val_bytes)
+    # Plain SET without options clears any existing TTL
+    if len(args) == 2:
+        store.set(key_bytes, val_bytes)
+        return SimpleString("OK")
+
+    expire_ms = None
+    has_ex = False
+    has_px = False
+
+    i = 2
+    while i < len(args):
+        raw_opt = args[i]
+        opt_str = (
+            raw_opt.decode("utf-8", errors="replace").upper()
+            if isinstance(raw_opt, (bytes, bytearray))
+            else str(raw_opt).upper()
+        )
+
+        if opt_str == "EX":
+            if has_ex or has_px or (i + 1 >= len(args)):
+                return RespError("ERR syntax error")
+            raw_val = args[i + 1]
+            try:
+                ex_sec = int(raw_val)
+            except ValueError:
+                return RespError("ERR value is not an integer or out of range")
+            if ex_sec <= 0:
+                return RespError("ERR invalid expire time in 'set' command")
+            has_ex = True
+            expire_ms = store.clock() + ex_sec * 1000
+            i += 2
+
+        elif opt_str == "PX":
+            if has_ex or has_px or (i + 1 >= len(args)):
+                return RespError("ERR syntax error")
+            raw_val = args[i + 1]
+            try:
+                px_ms = int(raw_val)
+            except ValueError:
+                return RespError("ERR value is not an integer or out of range")
+            if px_ms <= 0:
+                return RespError("ERR invalid expire time in 'set' command")
+            has_px = True
+            expire_ms = store.clock() + px_ms
+            i += 2
+
+        else:
+            return RespError("ERR syntax error")
+
+    store.set(key_bytes, val_bytes, expire_ms=expire_ms)
     return SimpleString("OK")
 
 
 def handle_get(store: Store, args: list[Any]) -> Any:
     """
     GET key
-    Get the value of key, or None (nil) if it does not exist.
+    Get the value of key, or None (nil) if it does not exist or has expired.
     """
     if len(args) != 1:
         return RespError("ERR wrong number of arguments for 'get' command")
 
-    key = args[0]
-    key_bytes = key if isinstance(key, bytes) else str(key).encode("utf-8")
-    return store.get(key_bytes)
+    return store.get(_to_bytes(args[0]))
 
 
 def handle_del(store: Store, args: list[Any]) -> Any:
@@ -76,24 +128,104 @@ def handle_del(store: Store, args: list[Any]) -> Any:
     if len(args) == 0:
         return RespError("ERR wrong number of arguments for 'del' command")
 
-    key_bytes_list = [
-        k if isinstance(k, bytes) else str(k).encode("utf-8") for k in args
-    ]
+    key_bytes_list = [_to_bytes(k) for k in args]
     return store.delete(*key_bytes_list)
 
 
 def handle_exists(store: Store, args: list[Any]) -> Any:
     """
     EXISTS key [key ...]
-    Returns the number of specified keys that exist.
+    Returns the number of specified keys that exist and have not expired.
     """
     if len(args) == 0:
         return RespError("ERR wrong number of arguments for 'exists' command")
 
-    key_bytes_list = [
-        k if isinstance(k, bytes) else str(k).encode("utf-8") for k in args
-    ]
+    key_bytes_list = [_to_bytes(k) for k in args]
     return store.exists(*key_bytes_list)
+
+
+def handle_expire(store: Store, args: list[Any]) -> Any:
+    """
+    EXPIRE key seconds
+    Sets a timeout on key in seconds.
+    """
+    if len(args) != 2:
+        return RespError("ERR wrong number of arguments for 'expire' command")
+
+    key_bytes = _to_bytes(args[0])
+    try:
+        seconds = int(args[1])
+    except ValueError:
+        return RespError("ERR value is not an integer or out of range")
+
+    return store.expire(key_bytes, seconds)
+
+
+def handle_pexpire(store: Store, args: list[Any]) -> Any:
+    """
+    PEXPIRE key milliseconds
+    Sets a timeout on key in milliseconds.
+    """
+    if len(args) != 2:
+        return RespError("ERR wrong number of arguments for 'pexpire' command")
+
+    key_bytes = _to_bytes(args[0])
+    try:
+        ms = int(args[1])
+    except ValueError:
+        return RespError("ERR value is not an integer or out of range")
+
+    return store.pexpire(key_bytes, ms)
+
+
+def handle_pexpireat(store: Store, args: list[Any]) -> Any:
+    """
+    PEXPIREAT key milliseconds-timestamp
+    Sets an absolute expiration timestamp on key in milliseconds.
+    """
+    if len(args) != 2:
+        return RespError("ERR wrong number of arguments for 'pexpireat' command")
+
+    key_bytes = _to_bytes(args[0])
+    try:
+        timestamp_ms = int(args[1])
+    except ValueError:
+        return RespError("ERR value is not an integer or out of range")
+
+    return store.pexpireat(key_bytes, timestamp_ms)
+
+
+def handle_ttl(store: Store, args: list[Any]) -> Any:
+    """
+    TTL key
+    Returns remaining TTL in seconds (-2 if missing/expired, -1 if no expiry).
+    """
+    if len(args) != 1:
+        return RespError("ERR wrong number of arguments for 'ttl' command")
+
+    return store.ttl(_to_bytes(args[0]))
+
+
+def handle_pttl(store: Store, args: list[Any]) -> Any:
+    """
+    PTTL key
+    Returns remaining TTL in milliseconds (-2 if missing/expired, -1 if no expiry).
+    """
+    if len(args) != 1:
+        return RespError("ERR wrong number of arguments for 'pttl' command")
+
+    return store.pttl(_to_bytes(args[0]))
+
+
+def handle_persist(store: Store, args: list[Any]) -> Any:
+    """
+    PERSIST key
+    Removes the timeout on key (returns 1 if removed, 0 if no expiry or key missing).
+    """
+    if len(args) != 1:
+        return RespError("ERR wrong number of arguments for 'persist' command")
+
+    return store.persist(_to_bytes(args[0]))
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +239,12 @@ COMMAND_TABLE: dict[str, CommandHandler] = {
     "GET": handle_get,
     "DEL": handle_del,
     "EXISTS": handle_exists,
+    "EXPIRE": handle_expire,
+    "PEXPIRE": handle_pexpire,
+    "PEXPIREAT": handle_pexpireat,
+    "TTL": handle_ttl,
+    "PTTL": handle_pttl,
+    "PERSIST": handle_persist,
 }
 
 
