@@ -5,6 +5,7 @@ Features:
 - Pipelining support: process all parsed messages in the buffer before draining.
 - Connection resilience: closes gracefully on client disconnect or protocol errors without tracebacks.
 - Active TTL expiration: background task sampling and purging expired keys every 100 ms.
+- AOF persistence: write-ahead logging with always/everysec/no fsync policies and startup replay.
 - Windows-compatible: standard library asyncio, no Unix-only calls or signals.
 """
 
@@ -13,6 +14,7 @@ import asyncio
 import logging
 from typing import Optional
 
+from mini_redis.aof import Aof, to_aof_record
 from mini_redis.commands import execute_command
 from mini_redis.resp import RESPParser, RespError, RespParseError, encode_resp
 from mini_redis.store import Store
@@ -28,12 +30,22 @@ class Server:
         host: str = "127.0.0.1",
         port: int = 6379,
         store: Optional[Store] = None,
+        aof_path: Optional[str] = "appendonly.aof",
+        appendfsync: str = "everysec",
+        enable_aof: bool = True,
     ) -> None:
         self.host = host
         self._configured_port = port
         self.store = store or Store()
         self._server: Optional[asyncio.Server] = None
         self._active_expiry_task: Optional[asyncio.Task] = None
+        self._aof_fsync_task: Optional[asyncio.Task] = None
+        self.enable_aof = enable_aof
+        self.aof: Optional[Aof] = (
+            Aof(filepath=aof_path, fsync=appendfsync)
+            if (enable_aof and aof_path)
+            else None
+        )
 
     @property
     def port(self) -> int:
@@ -52,7 +64,16 @@ class Server:
                     sample_size=20, threshold_ratio=0.25, max_loops=10
                 )
         except asyncio.CancelledError:
-            # Clean cancellation on server shutdown
+            pass
+
+    async def _aof_fsync_loop(self) -> None:
+        """Background coroutine that flushes and fsyncs AOF once per second."""
+        try:
+            while True:
+                await asyncio.sleep(1.0)
+                if self.aof:
+                    self.aof.sync()
+        except asyncio.CancelledError:
             pass
 
     async def handle_client(
@@ -84,9 +105,13 @@ class Server:
                     if msg is None:
                         break
 
-                    # Dispatch command
+                    # Dispatch command: apply to store, append to AOF, then prepare reply
                     if isinstance(msg, list):
                         result = execute_command(self.store, msg)
+                        if self.aof:
+                            record = to_aof_record(self.store, msg, result)
+                            if record is not None:
+                                self.aof.append(record)
                     else:
                         result = RespError(
                             "ERR Protocol error: expected array of command arguments"
@@ -113,13 +138,29 @@ class Server:
 
     async def start(self) -> None:
         """Start listening for incoming client connections and launch background tasks."""
+        if self.aof:
+            # Replay existing AOF into store with logging disabled
+            self.aof.replay(self.store)
+            # Open AOF in binary append mode
+            self.aof.open()
+            if self.aof.fsync == "everysec":
+                self._aof_fsync_task = asyncio.create_task(self._aof_fsync_loop())
+
         self._server = await asyncio.start_server(
             self.handle_client, host=self.host, port=self._configured_port
         )
         self._active_expiry_task = asyncio.create_task(self._active_expiry_loop())
 
     async def stop(self) -> None:
-        """Stop listening, cancel background tasks, and close the server."""
+        """Stop listening, cancel background tasks, flush AOF, and close server."""
+        if self._aof_fsync_task:
+            self._aof_fsync_task.cancel()
+            try:
+                await self._aof_fsync_task
+            except asyncio.CancelledError:
+                pass
+            self._aof_fsync_task = None
+
         if self._active_expiry_task:
             self._active_expiry_task.cancel()
             try:
@@ -132,6 +173,9 @@ class Server:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
+
+        if self.aof:
+            self.aof.close()
 
     async def serve_forever(self) -> None:
         """Run the server until cancelled."""
@@ -151,9 +195,30 @@ def main() -> None:
     parser.add_argument(
         "--port", type=int, default=6379, help="TCP port to bind (default: 6379)"
     )
+    parser.add_argument(
+        "--aof-path", default="appendonly.aof", help="Path to AOF file (default: appendonly.aof)"
+    )
+    parser.add_argument(
+        "--appendfsync",
+        choices=["always", "everysec", "no"],
+        default="everysec",
+        help="fsync policy: always, everysec, or no (default: everysec)",
+    )
+    parser.add_argument(
+        "--no-aof",
+        action="store_true",
+        default=False,
+        help="Disable AOF persistence completely",
+    )
     args = parser.parse_args()
 
-    server = Server(host=args.host, port=args.port)
+    server = Server(
+        host=args.host,
+        port=args.port,
+        aof_path=args.aof_path,
+        appendfsync=args.appendfsync,
+        enable_aof=not args.no_aof,
+    )
     try:
         asyncio.run(server.serve_forever())
     except KeyboardInterrupt:

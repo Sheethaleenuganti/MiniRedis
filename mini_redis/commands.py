@@ -47,7 +47,7 @@ def handle_echo(_store: Store, args: list[Any]) -> Any:
 
 def handle_set(store: Store, args: list[Any]) -> Any:
     """
-    SET key value [EX seconds | PX milliseconds]
+    SET key value [EX seconds | PX milliseconds | PXAT unix-time-milliseconds]
     Sets key to hold string value with optional expiration.
     """
     if len(args) < 2:
@@ -64,6 +64,7 @@ def handle_set(store: Store, args: list[Any]) -> Any:
     expire_ms = None
     has_ex = False
     has_px = False
+    has_pxat = False
 
     i = 2
     while i < len(args):
@@ -75,7 +76,7 @@ def handle_set(store: Store, args: list[Any]) -> Any:
         )
 
         if opt_str == "EX":
-            if has_ex or has_px or (i + 1 >= len(args)):
+            if has_ex or has_px or has_pxat or (i + 1 >= len(args)):
                 return RespError("ERR syntax error")
             raw_val = args[i + 1]
             try:
@@ -89,7 +90,7 @@ def handle_set(store: Store, args: list[Any]) -> Any:
             i += 2
 
         elif opt_str == "PX":
-            if has_ex or has_px or (i + 1 >= len(args)):
+            if has_ex or has_px or has_pxat or (i + 1 >= len(args)):
                 return RespError("ERR syntax error")
             raw_val = args[i + 1]
             try:
@@ -102,11 +103,26 @@ def handle_set(store: Store, args: list[Any]) -> Any:
             expire_ms = store.clock() + px_ms
             i += 2
 
+        elif opt_str == "PXAT":
+            if has_ex or has_px or has_pxat or (i + 1 >= len(args)):
+                return RespError("ERR syntax error")
+            raw_val = args[i + 1]
+            try:
+                pxat_ms = int(raw_val)
+            except ValueError:
+                return RespError("ERR value is not an integer or out of range")
+            if pxat_ms <= 0:
+                return RespError("ERR invalid expire time in 'set' command")
+            has_pxat = True
+            expire_ms = pxat_ms
+            i += 2
+
         else:
             return RespError("ERR syntax error")
 
     store.set(key_bytes, val_bytes, expire_ms=expire_ms)
     return SimpleString("OK")
+
 
 
 def handle_get(store: Store, args: list[Any]) -> Any:
